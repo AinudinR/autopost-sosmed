@@ -27,4 +27,4 @@ jobs:
           AZURE_SPEECH_REGION: ${{ secrets.AZURE_SPEECH_REGION }}
           AP_BASE_URL: ${{ secrets.AP_BASE_URL }}
           AP_SECRET: ${{ secrets.AP_SECRET }}
-        run: python -u main.py
+        run: python -u autopost.py
