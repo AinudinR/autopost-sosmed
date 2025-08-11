@@ -5,3 +5,8 @@ google-auth==2.34.0
 google-auth-oauthlib==1.2.1
 python-dateutil==2.9.0.post0
 pytz==2024.1
+gTTS==2.5.1
+flask
+python-telegram-bot==13.15
+urllib3<2.0
+telegram
