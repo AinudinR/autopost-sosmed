@@ -317,41 +317,36 @@ def parse_wib_time(date_str: str, time_str: str) -> datetime:
 
 
 def pick_job(csv_path: str = 'queue.csv'):
-    today = datetime.now(WIB).date()
+    """
+    Memilih pekerjaan dari file CSV dengan logika yang lebih sederhana.
+    Akan menjalankan pekerjaan jika waktunya sudah lewat tapi belum lebih dari 1 jam yang lalu.
+    """
     now = datetime.now(WIB)
     if not os.path.exists(csv_path):
         log(f'{csv_path} tidak ditemukan')
         return None
-    items = []
+        
     with open(csv_path, newline='', encoding='utf-8') as f:
         for row in csv.DictReader(f):
-            tgl = (row.get('Tanggal') or '').strip()
-            if not tgl: continue
-            try:
-                y, m, d = map(int, tgl.split('-'))
-                row_date = datetime(y, m, d).date()
-            except Exception:
-                continue
-            if row_date != today: continue
-            
+            # Check 1: Has it been posted to YouTube already?
             status = (row.get('Status') or '').strip()
             if "POSTED-YT" in status:
                 continue
 
-            jam = (row.get('JamWIB') or '07:30').strip()
+            # Check 2: Is it time to post?
             try:
-                dt = parse_wib_time(tgl, jam)
+                scheduled_dt = parse_wib_time(row.get('Tanggal'), row.get('JamWIB'))
+                time_difference = (now - scheduled_dt).total_seconds()
+
+                # Jika jadwal sudah lewat (positif) tapi belum lebih dari 1 jam (3600 detik)
+                if 0 <= time_difference < 3600:
+                    log(f"Menemukan jadwal yang valid: {row.get('Judul')}")
+                    return scheduled_dt, row
             except Exception:
-                dt = WIB.localize(
-                    datetime(today.year, today.month, today.day, 7, 30))
-            if abs((dt - now).total_seconds()) <= 3 * 3600:
-                items.append((dt, row))
-    if not items: return None
-    items.sort(key=lambda x: abs((x[0] - now).total_seconds()))
-    if os.environ.get('FORCE_RUN', '0') == '1':
-        log("FORCE_RUN aktif, memilih pekerjaan pertama.")
-        return items[0]
-    return items[0]
+                # Lewati baris jika format tanggal/waktu salah atau kosong
+                continue
+            
+    return None # No jobs are ready to be posted right now
 
 
 def mark_posted(csv_path: str,
