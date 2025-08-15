@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-autopost.py — End-to-end & robust (WIB-aware)
-Baca CSV → (fallback deteksi tanggal/jam) → TTS (Azure) → render 9:16 (MoviePy) → upload YouTube → tandai POSTED → (opsional) kirim Telegram.
+autopost.py — gTTS default, ElevenLabs optional, WIB-aware
+Baca CSV → (fallback deteksi tanggal/jam) → TTS (gTTS/ELEVEN) → render 9:16 (MoviePy) → upload YouTube → tandai POSTED → (opsional) Telegram.
 
-ENV yang digunakan:
-  - AZURE_SPEECH_KEY
-  - AZURE_SPEECH_REGION
-  - GOOGLE_CLIENT_ID
-  - GOOGLE_CLIENT_SECRET
-  - GOOGLE_REFRESH_TOKEN
-  - TELEGRAM_BOT_TOKEN        (opsional; aktif kalau --telegram dipakai & env tersedia)
-  - TELEGRAM_CHAT_ID          (opsional; ID chat target, mis. -1001234567890)
-  - AP_BASE_URL, AP_SECRET    (opsional; untuk webhook notify)
+ENV yang digunakan (opsional semua kecuali YouTube saat upload):
+  - ELEVENLABS_API_KEY      (opsional)
+  - ELEVENLABS_VOICE_ID     (opsional)
+  - GOOGLE_CLIENT_ID        (wajib jika upload YT)
+  - GOOGLE_CLIENT_SECRET    (wajib jika upload YT)
+  - GOOGLE_REFRESH_TOKEN    (wajib jika upload YT)
+  - TELEGRAM_BOT_TOKEN      (opsional)
+  - TELEGRAM_CHAT_ID        (opsional)
+  - AP_BASE_URL, AP_SECRET  (opsional; webhook notify)
 
-Dependensi:
-  pip install moviepy azure-cognitiveservices-speech google-api-python-client google-auth google-auth-oauthlib
+Dependensi penting:
+  pip install moviepy gTTS google-api-python-client google-auth google-auth-oauthlib
+  # sarankan: pillow==9.5.0 (hindari TextClip error di Pillow 10+)
+  sudo apt-get install -y ffmpeg
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ import sys
 import json
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -58,26 +60,10 @@ def log(msg: str) -> None:
 
 # ====== Util ======
 def strip_all(row: Dict[str, str]) -> Dict[str, str]:
-    return {k: (v.strip() if isinstance(v, str) else v) for k, v in row.items()}
-
-def detect_header_by_first_cell(first_line: str) -> bool:
-    """
-    Jika sel pertama pola YYYY-MM-DD → kemungkinan data (tidak ada header).
-    """
-    try:
-        cells = next(csv.reader([first_line]))
-    except Exception:
-        return True
-    if not cells:
-        return True
-    first = (cells[0] or "").strip()
-    return not bool(re.match(r"^\d{4}-\d{2}-\d{2}$", first))
+    return {k.strip() if isinstance(k, str) else k: (v.strip() if isinstance(v, str) else v)
+            for k, v in row.items()}
 
 def sniff_delimiter_and_header(sample_text: str) -> Tuple[str, Optional[bool]]:
-    """
-    Coba deteksi delimiter & keberadaan header dari cuplikan awal file.
-    Kembalikan (delimiter, has_header|None).
-    """
     try:
         dialect = csv.Sniffer().sniff(sample_text, delimiters=[",",";","\t","|"])
         delim = dialect.delimiter
@@ -90,11 +76,18 @@ def sniff_delimiter_and_header(sample_text: str) -> Tuple[str, Optional[bool]]:
         pass
     return delim, has_header
 
+def detect_header_by_first_cell(first_line: str) -> bool:
+    try:
+        cells = next(csv.reader([first_line]))
+    except Exception:
+        return True
+    if not cells:
+        return True
+    first = (cells[0] or "").strip()
+    # jika YYYY-MM-DD → kemungkinan bukan header
+    return not bool(re.match(r"^\d{4}-\d{2}-\d{2}$", first))
+
 def read_queue_rows(csv_path: str) -> Iterable[Dict[str, str]]:
-    """
-    Baca CSV dengan deteksi delimiter + header.
-    Kompatibel CSV tanpa header (baris pertama data) & alias kolom Inggris.
-    """
     if not os.path.exists(csv_path):
         raise FileNotFoundError(csv_path)
 
@@ -106,15 +99,19 @@ def read_queue_rows(csv_path: str) -> Iterable[Dict[str, str]]:
         first_line = f.readline().rstrip("\n")
         manual_header = detect_header_by_first_cell(first_line)
         f.seek(0)
-        # putuskan ada header atau tidak
         has_header = sniffer_header if sniffer_header is not None else manual_header
 
         reader = csv.DictReader(f, delimiter=delim) if has_header \
                  else csv.DictReader(f, fieldnames=EXPECTED_HEADERS, delimiter=delim)
 
+        # strip spasi pada NAMA kolom header
+        if hasattr(reader, "fieldnames") and reader.fieldnames:
+            reader.fieldnames = [ (h.strip() if isinstance(h, str) else h) for h in reader.fieldnames ]
+
         for row in reader:
             row = strip_all(row)
             normalized = dict(row)
+            # alias Inggris -> Indonesia
             for en, idn in ALIAS_TO_ID.items():
                 if idn not in normalized and en in normalized and normalized[en] not in (None, ""):
                     normalized[idn] = normalized[en]
@@ -125,10 +122,10 @@ def normalize_row(row: Dict[str, str]) -> Dict[str, str]:
 
 # ====== Fallback cari tanggal/jam di kolom manapun ======
 DATE_PATTERNS = [
-    r"\b\d{4}-\d{2}-\d{2}\b",   # 2025-08-15
-    r"\b\d{4}/\d{2}/\d{2}\b",   # 2025/08/15
-    r"\b\d{2}-\d{2}-\d{4}\b",   # 15-08-2025
-    r"\b\d{2}/\d{2}/\d{4}\b",   # 15/08/2025
+    r"\b\d{4}-\d{2}-\d{2}\b",
+    r"\b\d{4}/\d{2}/\d{2}\b",
+    r"\b\d{2}-\d{2}-\d{4}\b",
+    r"\b\d{2}/\d{2}/\d{4}\b",
 ]
 TIME_PATTERN = r"\b([01]\d|2[0-3]):[0-5]\d\b"  # HH:MM
 
@@ -143,7 +140,6 @@ def _find_first(patterns, text: str) -> Optional[str]:
     return None
 
 def smart_pick_date_time(row: dict) -> Tuple[str, str]:
-    """Jika 'Tanggal'/'JamWIB' kosong, cari pattern tanggal & jam di nilai kolom lain."""
     tanggal = (row.get("Tanggal") or "").strip()
     jam = (row.get("JamWIB") or "").strip()
 
@@ -153,19 +149,16 @@ def smart_pick_date_time(row: dict) -> Tuple[str, str]:
             if hit:
                 tanggal = hit
                 break
-
     if not jam:
         for v in row.values():
             hit = _find_first(TIME_PATTERN, str(v or ""))
             if hit:
                 jam = hit
                 break
-
     return tanggal, jam
 
 # ====== Parsing tanggal fleksibel ======
 def parse_wib_time(tanggal_str: str, jam_str: str) -> datetime:
-    """Terima beberapa format umum."""
     tanggal_str = (tanggal_str or "").strip()
     jam_str = (jam_str or "").strip()
     candidates = [
@@ -204,15 +197,10 @@ def pick_job(csv_path: str, max_late_seconds: int, *, debug: bool = False) -> Op
 
         tanggal = (row.get("Tanggal") or "").strip()
         jam = (row.get("JamWIB") or "").strip()
-
-        # fallback cari di kolom lain jika kosong
         if not tanggal or not jam:
             tgl_fallback, jam_fallback = smart_pick_date_time(row)
-            if not tanggal:
-                tanggal = tgl_fallback or ""
-            if not jam:
-                jam = jam_fallback or ""
-
+            if not tanggal: tanggal = tgl_fallback or ""
+            if not jam: jam = jam_fallback or ""
         if not tanggal or not jam:
             if debug: log(f"skip[{idx_raw}]: tanggal/jam kosong -> {tanggal} | {jam}")
             continue
@@ -224,17 +212,13 @@ def pick_job(csv_path: str, max_late_seconds: int, *, debug: bool = False) -> Op
             continue
 
         lateness = (now - scheduled_dt).total_seconds()
-        if lateness >= 0 and lateness <= max_late_seconds:
-            pass
-        else:
+        if not (0 <= lateness <= max_late_seconds):
             if debug:
-                if lateness < 0:
-                    log(f"skip[{idx_raw}]: belum due ({-int(lateness)} dtk lebih awal)")
-                else:
-                    log(f"skip[{idx_raw}]: telat {int(lateness)} dtk > max {max_late_seconds}")
+                if lateness < 0: log(f"skip[{idx_raw}]: belum due ({-int(lateness)} dtk lebih awal)")
+                else: log(f"skip[{idx_raw}]: telat {int(lateness)} dtk > max {max_late_seconds}")
+            continue
 
-        if lateness >= 0 and lateness <= max_late_seconds:
-            candidates.append(Candidate(scheduled_dt, row, lateness))
+        candidates.append(Candidate(scheduled_dt, row, lateness))
 
     if not candidates:
         log("Tidak ada jadwal due dalam batas keterlambatan.")
@@ -245,18 +229,13 @@ def pick_job(csv_path: str, max_late_seconds: int, *, debug: bool = False) -> Op
     log(f"Terpilih: {chosen.row.get('Judul','(tanpa judul)')} @ {chosen.scheduled_dt.strftime('%Y-%m-%d %H:%M %Z')} | telat {int(chosen.lateness_sec)} dtk")
     return chosen.scheduled_dt, chosen.row
 
-# ====== Update CSV (tulis dengan header baku) ======
-def _sniff_delim_for_write(csv_path: str) -> str:
-    try:
-        with open(csv_path, "r", encoding="utf-8") as f:
-            sample = f.read(4096)
-        delim, _ = sniff_delimiter_and_header(sample)
-        return delim or ","
-    except Exception:
-        return ","
-
+# ====== Update CSV ======
 def write_rows_with_header(csv_path: str, rows: List[Dict[str, str]]) -> None:
-    delim = _sniff_delim_for_write(csv_path)
+    # pakai delimiter yang sama saat baca
+    with open(csv_path, "r", encoding="utf-8") as f:
+        sample = f.read(4096)
+    delim, _ = sniff_delimiter_and_header(sample)
+
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=EXPECTED_HEADERS, delimiter=delim)
         w.writeheader()
@@ -286,21 +265,62 @@ def mark_posted(csv_path: str, target_row: Dict[str, str], platform: str, note: 
     write_rows_with_header(csv_path, rows)
     log(f"Ditandai POSTED: {rows[idx].get('Judul','(tanpa judul)')} -> {rows[idx]['Status']}")
 
-# ====== RENDER PIPELINE ======
-def tts_azure(text: str, out_wav: str, voice: str = "id-ID-ArdiNeural") -> None:
-    import azure.cognitiveservices.speech as speechsdk
-    key = os.environ.get("AZURE_SPEECH_KEY", "").strip()
-    region = os.environ.get("AZURE_SPEECH_REGION", "").strip()
-    if not key or not region:
-        raise RuntimeError("AZURE_SPEECH_KEY/REGION tidak ditemukan di env.")
-    speech_config = speechsdk.SpeechConfig(subscription=key, region=region)
-    speech_config.speech_synthesis_voice_name = voice
-    audio_config = speechsdk.audio.AudioOutputConfig(filename=out_wav)
-    synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
-    result = synthesizer.speak_text_async(text).get()
-    if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
-        raise RuntimeError(f"TTS gagal: {result.reason}")
+# ====== TTS: gTTS & ElevenLabs ======
+def tts_gtts(text: str, out_mp3: str, lang: str = "id") -> None:
+    from gtts import gTTS
+    tts = gTTS(text=text, lang=lang)
+    tts.save(out_mp3)
 
+def tts_elevenlabs(text: str, out_mp3: str, api_key: str, voice_id: str) -> None:
+    import urllib.request, json
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    payload = {
+        "text": text,
+        "model_id": "eleven_multilingual_v2",
+        "voice_settings": {"stability": 0.35, "similarity_boost": 0.75}
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url=url,
+        data=data,
+        headers={
+            "xi-api-key": api_key,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        audio = resp.read()
+    with open(out_mp3, "wb") as f:
+        f.write(audio)
+
+def synth_speech(text: str, prefer_engine: str = "auto") -> str:
+    """
+    Kembalikan path file audio (mp3). Urutan:
+    - 'elevenlabs' jika env tersedia (atau prefer_engine='elevenlabs')
+    - fallback ke gTTS
+    """
+    tmpdir = tempfile.mkdtemp(prefix="autopost_")
+    out_mp3 = os.path.join(tmpdir, "tts.mp3")
+
+    eleven_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+    eleven_voice = os.environ.get("ELEVENLABS_VOICE_ID", "").strip()
+
+    use_eleven = (prefer_engine in ("auto", "elevenlabs")) and eleven_key and eleven_voice
+    if use_eleven:
+        try:
+            log("TTS: ElevenLabs")
+            tts_elevenlabs(text, out_mp3, api_key=eleven_key, voice_id=eleven_voice)
+            return out_mp3
+        except Exception as e:
+            log(f"TTS ElevenLabs gagal ({e}), fallback ke gTTS.")
+
+    log("TTS: gTTS (default)")
+    tts_gtts(text, out_mp3, lang="id")
+    return out_mp3
+
+# ====== RENDER PIPELINE ======
 def sanitize_filename(name: str) -> str:
     name = re.sub(r"[^\w\s-]", "", name, flags=re.UNICODE)
     name = re.sub(r"\s+", "_", name).strip("_")
@@ -308,15 +328,12 @@ def sanitize_filename(name: str) -> str:
 
 def wrap_text(text: str, width: int = 28) -> str:
     words = text.split()
-    lines = []
-    cur = []
-    count = 0
+    lines, cur, count = [], [], 0
     for w in words:
         add = len(w) + (1 if cur else 0)
         if count + add > width:
             lines.append(" ".join(cur))
-            cur = [w]
-            count = len(w)
+            cur, count = [w], len(w)
         else:
             cur.append(w)
             count += add
@@ -324,7 +341,7 @@ def wrap_text(text: str, width: int = 28) -> str:
         lines.append(" ".join(cur))
     return "\n".join(lines)
 
-def render_video(row: Dict[str, str], out_dir: str = "out") -> str:
+def render_video(row: Dict[str, str], voice_engine: str = "auto", out_dir: str = "out") -> str:
     from moviepy.editor import (
         VideoFileClip, AudioFileClip, CompositeAudioClip, CompositeVideoClip,
         TextClip, ColorClip
@@ -353,11 +370,9 @@ def render_video(row: Dict[str, str], out_dir: str = "out") -> str:
     if bg_clip is None:
         bg_clip = ColorClip(size=(W, H), color=(10, 10, 10)).set_duration(60)
 
-    # TTS
-    tmpdir = tempfile.mkdtemp(prefix="autopost_")
-    tts_wav = os.path.join(tmpdir, "tts.wav")
-    tts_azure(desc or title, tts_wav)
-    voice = AudioFileClip(tts_wav)
+    # TTS (mp3)
+    tts_mp3 = synth_speech(desc or title, prefer_engine=voice_engine)
+    voice = AudioFileClip(tts_mp3)
 
     # Durasi minimal
     base_dur = max(voice.duration + 0.5, 10.0)
@@ -373,10 +388,7 @@ def render_video(row: Dict[str, str], out_dir: str = "out") -> str:
             music_clip = None
 
     # Audio final
-    if music_clip is not None:
-        audio = CompositeAudioClip([music_clip, voice.volumex(1.0)])
-    else:
-        audio = voice
+    audio = CompositeAudioClip([music_clip, voice]) if music_clip is not None else voice
     bg_clip = bg_clip.set_audio(audio)
 
     # Overlay Title + Desc
@@ -414,47 +426,32 @@ def render_video(row: Dict[str, str], out_dir: str = "out") -> str:
 def build_youtube_service() -> "googleapiclient.discovery.Resource":
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
-
     client_id = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
     client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
     refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN", "").strip()
     if not client_id or not client_secret or not refresh_token:
         raise RuntimeError("Env GOOGLE_CLIENT_ID/SECRET/REFRESH_TOKEN kosong.")
-
     token_uri = "https://oauth2.googleapis.com/token"
-    creds = Credentials(
-        None,
-        refresh_token=refresh_token,
-        token_uri=token_uri,
-        client_id=client_id,
-        client_secret=client_secret,
-        scopes=[
-            "https://www.googleapis.com/auth/youtube.upload",
-            "https://www.googleapis.com/auth/youtube",
-        ],
-    )
+    creds = Credentials(None, refresh_token=refresh_token, token_uri=token_uri,
+                        client_id=client_id, client_secret=client_secret,
+                        scopes=["https://www.googleapis.com/auth/youtube.upload",
+                                "https://www.googleapis.com/auth/youtube"])
     return build("youtube", "v3", credentials=creds, cache_discovery=False)
 
 def parse_tags(hashtags: str) -> List[str]:
     tags = []
     for tok in re.split(r"[,\s]+", hashtags or ""):
         tok = tok.strip()
-        if not tok:
-            continue
-        if tok.startswith("#"):
-            tok = tok[1:]
-        if tok:
-            tags.append(tok[:30])
+        if not tok: continue
+        if tok.startswith("#"): tok = tok[1:]
+        if tok: tags.append(tok[:30])
     return tags[:10]
 
 def upload_youtube_short(file_path: str, title: str, description: str, hashtags: str) -> str:
     from googleapiclient.http import MediaFileUpload
     yt = build_youtube_service()
-
     desc_full = description.strip()
-    if hashtags:
-        desc_full = (desc_full + "\n\n" + hashtags).strip()
-
+    if hashtags: desc_full = (desc_full + "\n\n" + hashtags).strip()
     body = {
         "snippet": {
             "title": title[:100],
@@ -462,13 +459,9 @@ def upload_youtube_short(file_path: str, title: str, description: str, hashtags:
             "tags": parse_tags(hashtags),
             "categoryId": "22",
         },
-        "status": {
-            "privacyStatus": "public",
-            "selfDeclaredMadeForKids": False,
-        },
+        "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False},
     }
     media = MediaFileUpload(file_path, mimetype="video/mp4", chunksize=-1, resumable=True)
-
     log("Upload ke YouTube...")
     request = yt.videos().insert(part="snippet,status", body=body, media_body=media)
     response = None
@@ -480,7 +473,7 @@ def upload_youtube_short(file_path: str, title: str, description: str, hashtags:
     log(f"Upload sukses: https://youtube.com/watch?v={video_id}")
     return video_id
 
-# ====== Telegram Notify (opsional) ======
+# ====== Telegram (opsional) ======
 def telegram_send_message(text: str) -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -501,14 +494,6 @@ def telegram_send_video(file_path: str, caption: str = "") -> None:
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
         return
-    # Batas ukuran file untuk bot Telegram (umum): ~50 MB (bervariasi tergantung update).
-    try:
-        size = os.path.getsize(file_path)
-    except Exception:
-        size = 0
-    if size > 49 * 1024 * 1024:  # >49MB: kirim teks saja agar aman
-        telegram_send_message(caption or os.path.basename(file_path))
-        return
     try:
         import urllib.request
         boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
@@ -521,18 +506,13 @@ def telegram_send_video(file_path: str, caption: str = "") -> None:
             data.append(f"--{boundary}\r\n".encode())
             data.append(f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode())
             data.append(b"Content-Type: video/mp4\r\n\r\n")
-            data.append(content)
-            data.append(b"\r\n")
-
+            data.append(content); data.append(b"\r\n")
         add_field("chat_id", chat_id)
-        if caption:
-            add_field("caption", caption)
-        with open(file_path, "rb") as f:
-            content = f.read()
+        if caption: add_field("caption", caption)
+        with open(file_path, "rb") as f: content = f.read()
         add_file("video", os.path.basename(file_path), content)
         data.append(f"--{boundary}--\r\n".encode())
         body = b"".join(data)
-
         req = urllib.request.Request(
             url=f"https://api.telegram.org/bot{token}/sendVideo",
             data=body,
@@ -566,13 +546,13 @@ def notify_backend(payload: dict) -> None:
 
 # ====== MAIN ======
 def main() -> None:
-    p = argparse.ArgumentParser(description="Autopost end-to-end (WIB-aware & robust CSV)")
+    p = argparse.ArgumentParser(description="Autopost (gTTS default, ElevenLabs optional)")
     p.add_argument("--csv", default="queue.csv")
     p.add_argument("--platform", default="YT", help="Label platform untuk Status")
     p.add_argument("--max-late", type=float, default=24.0, help="Catch-up (jam)")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--skip-upload", action="store_true", help="Hanya render, tidak upload")
-    p.add_argument("--voice", default="id-ID-ArdiNeural")
+    p.add_argument("--voice", default="auto", choices=["auto","gtts","elevenlabs"], help="Mesin TTS")
     p.add_argument("--debug", action="store_true")
     p.add_argument("--telegram", action="store_true", help="Kirim notifikasi Telegram bila env tersedia")
     args = p.parse_args()
@@ -595,9 +575,10 @@ def main() -> None:
     if link and link not in desc:
         desc = (desc + "\n\n" + link).strip()
 
-    # Render
+    # Render (pakai gTTS/ELEVEN sesuai arg/env)
     try:
-        out_path = render_video(row)
+        engine = "auto" if args.voice == "auto" else args.voice
+        out_path = render_video(row, voice_engine=engine)
     except Exception as e:
         log(f"RENDER ERROR: {e}")
         raise
@@ -626,7 +607,6 @@ def main() -> None:
     if args.telegram:
         yt_link = f"https://youtube.com/watch?v={video_id}" if video_id else ""
         caption = f"{title}\n{yt_link}".strip()
-        # kirim video bila kecil, kalau terlalu besar kirim teks saja
         try:
             telegram_send_video(out_path, caption=caption)
         except Exception as e:
