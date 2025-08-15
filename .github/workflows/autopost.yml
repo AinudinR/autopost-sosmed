@@ -2,18 +2,20 @@ name: autopost
 
 on:
   schedule:
-    - cron: '30 0 * * *'   # 07:30 WIB
-    - cron: '0 12 * * *'   # 19:00 WIB
+    - cron: '30 0 * * *'      # 07:30 WIB (00:30 UTC)
+    - cron: '0 12 * * *'      # 19:00 WIB (12:00 UTC)
+    - cron: '*/10 * * * *'    # cek tiap 10 menit (UTC)
   workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Jakarta
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+        with: { python-version: '3.11' }
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
