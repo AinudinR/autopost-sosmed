@@ -39,6 +39,8 @@ jobs:
           # (opsional) ffmpeg & font umum
           sudo apt-get update
           sudo apt-get install -y ffmpeg fonts-dejavu-core
+          sudo apt-get install -y imagemagick
+          echo "IMAGE_MAGICK_BINARY=/usr/bin/convert" >> $GITHUB_ENV
 
       - name: Run autopost (debug)
         run: python -u autopost.py --debug --dry-run
