@@ -32,8 +32,8 @@ jobs:
           pip install "moviepy==1.0.3" imageio imageio-ffmpeg numpy tqdm proglog
           # Pillow < 10 supaya tidak error ANTIALIAS di TextClip
           pip install "pillow==9.5.0"
-          # Azure TTS
-          pip install azure-cognitiveservices-speech
+          # Azure gTTS
+          pip install gTTS
           # YouTube API
           pip install google-api-python-client google-auth google-auth-oauthlib
           # (opsional) ffmpeg & font umum
