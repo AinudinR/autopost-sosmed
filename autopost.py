@@ -17,7 +17,7 @@ ENV yang digunakan (opsional semua kecuali YouTube saat upload):
 Dependensi penting:
   pip install moviepy gTTS google-api-python-client google-auth google-auth-oauthlib
   # sarankan: pillow==9.5.0 (hindari TextClip error di Pillow 10+)
-  sudo apt-get install -y ffmpeg
+  sudo apt-get install -y ffmpeg fonts-dejavu-core
 """
 
 from __future__ import annotations
@@ -32,6 +32,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
+
+# ====== tambahan utk render teks tanpa ImageMagick ======
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 
@@ -322,6 +324,81 @@ def synth_speech(text: str, prefer_engine: str = "auto") -> str:
     tts_gtts(text, out_mp3, lang="id")
     return out_mp3
 
+# ====== helper: render teks dengan PIL → ImageClip (tanpa ImageMagick) ======
+def _load_font(size: int, bold: bool = False):
+    cands = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf" if bold else "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    ]
+    for p in cands:
+        if os.path.exists(p):
+            try:
+                return ImageFont.truetype(p, size=size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+def text_image_clip(text: str, max_width_px: int, fontsize: int, *, bold=False,
+                    color=(255,255,255,255), stroke_color=(0,0,0,255), stroke_width=2,
+                    align="center", padding=(16, 12), duration=5.0):
+    """Render teks → gambar (PIL) → ImageClip MoviePy (tanpa ImageMagick)."""
+    from moviepy.editor import ImageClip
+
+    text = text or ""
+    font = _load_font(fontsize, bold=bold)
+
+    # wrap berdasarkan pixel width
+    lines = []
+    for raw in text.split("\n"):
+        words = raw.split(" ")
+        cur = ""
+        for w in words:
+            test = (cur + " " + w).strip()
+            wpx = font.getlength(test)
+            if wpx + 2*padding[0] <= max_width_px or not cur:
+                cur = test
+            else:
+                lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+
+    line_h = int(font.size * 1.25)
+    text_h = max(line_h * max(len(lines), 1), line_h)
+    text_w = 0
+    for l in lines:
+        text_w = max(text_w, int(font.getlength(l)))
+
+    W = max(text_w, 1) + 2*padding[0]
+    if W < max_width_px + 2*padding[0]:
+        W = max_width_px + 2*padding[0]
+    H = text_h + 2*padding[1]
+
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    y = padding[1]
+    for line in lines:
+        lw = font.getlength(line)
+        if align.lower() == "west":
+            x = padding[0]
+        elif align.lower() == "east":
+            x = W - padding[0] - lw
+        else:
+            x = (W - lw) / 2
+
+        if stroke_width and stroke_color:
+            sx, sy = stroke_width, stroke_width
+            for dx in range(-sx, sx+1):
+                for dy in range(-sy, sy+1):
+                    if dx or dy:
+                        draw.text((x+dx, y+dy), line, font=font, fill=stroke_color)
+        draw.text((x, y), line, font=font, fill=color)
+        y += line_h
+
+    frame = np.array(img)
+    return ImageClip(frame).set_duration(duration)
+
 # ====== RENDER PIPELINE ======
 def sanitize_filename(name: str) -> str:
     name = re.sub(r"[^\w\s-]", "", name, flags=re.UNICODE)
@@ -346,7 +423,7 @@ def wrap_text(text: str, width: int = 28) -> str:
 def render_video(row: Dict[str, str], voice_engine: str = "auto", out_dir: str = "out") -> str:
     from moviepy.editor import (
         VideoFileClip, AudioFileClip, CompositeAudioClip, CompositeVideoClip,
-        TextClip, ColorClip
+        ColorClip
     )
     os.makedirs(out_dir, exist_ok=True)
 
@@ -393,23 +470,30 @@ def render_video(row: Dict[str, str], voice_engine: str = "auto", out_dir: str =
     audio = CompositeAudioClip([music_clip, voice]) if music_clip is not None else voice
     bg_clip = bg_clip.set_audio(audio)
 
-    # Overlay Title + Desc
-    wrapped = wrap_text(desc if desc else title, width=28)
-    try:
-        title_clip = TextClip(title, fontsize=72, font="Arial-Bold", color="white",
-                              stroke_color="black", stroke_width=2, method="caption",
-                              size=(W-120, None))
-    except Exception:
-        title_clip = TextClip(title, fontsize=72, color="white")
-    title_clip = title_clip.set_position(("center", 80)).set_duration(base_dur)
+    # Overlay Title + Desc TANPA ImageMagick (pakai PIL)
+    title_clip = text_image_clip(
+        title,
+        max_width_px=W-120,
+        fontsize=72,
+        bold=True,
+        color=(255,255,255,255),
+        stroke_color=(0,0,0,255),
+        stroke_width=2,
+        align="center",
+        duration=base_dur,
+    ).set_position(("center", 80))
 
-    try:
-        body_clip = TextClip(wrapped, fontsize=54, font="Arial", color="white",
-                             stroke_color="black", stroke_width=1, method="caption",
-                             size=(W-140, None), align="West")
-    except Exception:
-        body_clip = TextClip(wrapped, fontsize=54, color="white")
-    body_clip = body_clip.set_position(("center", 240)).set_duration(base_dur)
+    body_clip = text_image_clip(
+        (desc if desc else title),
+        max_width_px=W-140,
+        fontsize=54,
+        bold=False,
+        color=(255,255,255,255),
+        stroke_color=(0,0,0,255),
+        stroke_width=1,
+        align="west",
+        duration=base_dur,
+    ).set_position(("center", 240))
 
     final = CompositeVideoClip([bg_clip, title_clip, body_clip], size=(W, H)).set_duration(base_dur)
 
