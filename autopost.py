@@ -32,6 +32,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
+from PIL import Image, ImageDraw, ImageFont
+import numpy as np
 
 WIB = ZoneInfo("Asia/Jakarta")
 
