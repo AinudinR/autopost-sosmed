@@ -413,7 +413,6 @@ def main() -> None:
     p.add_argument("--debug", action="store_true")
     p.add_argument("--skip-upload", action="store_true", help="Hanya render, tidak upload")
     p.add_argument("--voice", default="id-ID-ArdiNeural")
-    p.add_argument("--debug", action="store_true")
     args = p.parse_args()
 
     csv_path = args.csv
