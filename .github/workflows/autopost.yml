@@ -29,4 +29,15 @@ jobs:
           AZURE_SPEECH_REGION: ${{ secrets.AZURE_SPEECH_REGION }}
           AP_BASE_URL: ${{ secrets.AP_BASE_URL }}
           AP_SECRET: ${{ secrets.AP_SECRET }}
+
+      - name: Install dependencies
+        run: |
+           python -m pip install --upgrade pip
+           # Pin Pillow < 10 agar TextClip (MoviePy) tidak error ANTIALIAS
+           pip install "pillow==9.5.0"
+           # MoviePy + Azure TTS + YouTube API
+           pip install "moviepy>=1.0.3" azure-cognitiveservices-speech \
+                google-api-python-client google-auth google-auth-oauthlib
+                
+      - name: Run autopost
         run: python -u autopost.py --debug --dry-run
