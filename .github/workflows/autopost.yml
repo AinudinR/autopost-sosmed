@@ -43,4 +43,4 @@ jobs:
           echo "IMAGE_MAGICK_BINARY=/usr/bin/convert" >> $GITHUB_ENV
 
       - name: Run autopost (debug)
-        run: python -u autopost.py --debug --dry-run
+        run: python -u autopost.py --platform YT --telegram
